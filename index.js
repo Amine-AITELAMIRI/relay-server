@@ -1,6 +1,7 @@
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const cors = require('cors');
+const RoombaController = require('./controllers/roomba');
 require('dotenv').config();
 
 const app = express();
@@ -11,7 +12,8 @@ app.use(cors());
 app.use(express.json());
 
 // ==================== STATE MANAGEMENT ====================
-let esp32Socket = null;  // The connected ESP32 WebSocket
+let esp32Socket = null;  // The connected ESP32 WebSocket (shutters)
+let esp32IrrigationSocket = null;  // The connected ESP32 Irrigation WebSocket
 let shuttersState = {
     s1: { pos: 0, dir: 0 },
     s2: { pos: 0, dir: 0 },
@@ -20,8 +22,22 @@ let shuttersState = {
     lastUpdate: null
 };
 
+let irrigationState = {
+    active: false,
+    duration: 0,
+    elapsed: 0,
+    completion: 0,
+    lastUpdate: null
+};
+
+let robotsState = {
+    roomba_j7: { battery: 0, phase: 'unknown', connected: false, lastUpdate: null },
+    braava_jet: { battery: 0, phase: 'unknown', connected: false, lastUpdate: null }
+};
+
 // Simple authentication (can be enhanced later)
 const ESP32_SECRET = process.env.ESP32_SECRET || 'your-esp32-secret-key';
+const ESP32_IRRIGATION_SECRET = process.env.ESP32_IRRIGATION_SECRET || 'my-super-secret-irrigation-key-54321';
 const APP_SECRET = process.env.APP_SECRET || 'your-app-secret-key';
 
 // ==================== HTTP API (for Mobile App) ====================
@@ -87,6 +103,71 @@ app.get('/api/schedules', (req, res) => {
     res.json({ message: 'Schedules request sent to ESP32' });
 });
 
+// ==================== ROBOT API ====================
+
+// Get all robots status
+app.get('/api/robots', (req, res) => {
+    res.json(robotsState);
+});
+
+// Get specific robot status
+app.get('/api/robots/:id', (req, res) => {
+    const robotId = req.params.id;
+    if (robotsState[robotId]) {
+        res.json(robotsState[robotId]);
+    } else {
+        res.status(404).json({ error: 'Robot not found' });
+    }
+});
+
+// Send command to robot
+app.post('/api/robots/:id/command', async (req, res) => {
+    const { token, command, roomId } = req.body;
+    const robotId = req.params.id;
+
+    // Simple auth check
+    if (token !== APP_SECRET) {
+        return res.status(401).json({ error: 'Unauthorized' });
+    }
+
+    // Validate robot exists
+    if (!robotsState[robotId]) {
+        return res.status(404).json({ error: 'Robot not found' });
+    }
+
+    // Execute command
+    try {
+        let result;
+        switch (command) {
+            case 'start':
+                result = await roombaController.start(robotId);
+                break;
+            case 'pause':
+                result = await roombaController.pause(robotId);
+                break;
+            case 'stop':
+                result = await roombaController.stop(robotId);
+                break;
+            case 'dock':
+                result = await roombaController.dock(robotId);
+                break;
+            case 'cleanRoom':
+                if (!roomId) {
+                    return res.status(400).json({ error: 'roomId required for cleanRoom command' });
+                }
+                result = await roombaController.cleanRoom(robotId, roomId);
+                break;
+            default:
+                return res.status(400).json({ error: 'Invalid command' });
+        }
+
+        res.json({ success: true, result });
+    } catch (error) {
+        console.error('Error executing robot command:', error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
 // ==================== WEBSOCKET SERVER (for ESP32 & App) ====================
 
 const wss = new WebSocketServer({ noServer: true });
@@ -96,6 +177,8 @@ wss.on('connection', (ws, request) => {
 
     if (clientType === '/esp32') {
         handleESP32Connection(ws);
+    } else if (clientType === '/esp32-irrigation') {
+        handleESP32IrrigationConnection(ws);
     } else if (clientType === '/app') {
         handleAppConnection(ws);
     } else {
@@ -168,6 +251,72 @@ function handleESP32Connection(ws) {
     });
 }
 
+// Handle ESP32 Irrigation WebSocket connection
+function handleESP32IrrigationConnection(ws) {
+    console.log('💧 ESP32 Irrigation connected');
+
+    // Authenticate ESP32 (simple token in first message)
+    let authenticated = false;
+
+    ws.on('message', (data) => {
+        try {
+            const message = JSON.parse(data.toString());
+
+            // First message should be authentication
+            if (!authenticated) {
+                if (message.type === 'AUTH' && message.secret === ESP32_IRRIGATION_SECRET) {
+                    authenticated = true;
+                    esp32IrrigationSocket = ws;
+                    ws.send(JSON.stringify({ type: 'AUTH_OK' }));
+                    console.log('✅ ESP32 Irrigation authenticated');
+
+                    // Request initial state
+                    ws.send(JSON.stringify({ type: 'REQUEST_STATE' }));
+                } else {
+                    ws.send(JSON.stringify({ type: 'AUTH_FAILED' }));
+                    ws.close();
+                }
+                return;
+            }
+
+            // Handle state updates from ESP32 Irrigation
+            if (message.type === 'IRRIGATION_STATE') {
+                irrigationState = {
+                    ...message.data,
+                    lastUpdate: new Date().toISOString()
+                };
+                console.log('💧 Irrigation state updated:', irrigationState);
+
+                // Broadcast to all connected apps
+                broadcastToApps({
+                    type: 'IRRIGATION_STATE',
+                    data: irrigationState
+                });
+            }
+
+            // Handle command completion from ESP32 Irrigation
+            if (message.type === 'IRRIGATION_COMMAND_COMPLETE') {
+                console.log('✓ Irrigation command completed');
+                broadcastToApps(message);
+            }
+
+        } catch (error) {
+            console.error('Error parsing ESP32 Irrigation message:', error);
+        }
+    });
+
+    ws.on('close', () => {
+        console.log('❌ ESP32 Irrigation disconnected');
+        if (esp32IrrigationSocket === ws) {
+            esp32IrrigationSocket = null;
+        }
+    });
+
+    ws.on('error', (error) => {
+        console.error('ESP32 Irrigation WebSocket error:', error);
+    });
+}
+
 // Handle Mobile App WebSocket connection
 function handleAppConnection(ws) {
     console.log('📱 Mobile app connected');
@@ -178,7 +327,7 @@ function handleAppConnection(ws) {
         data: shuttersState
     }));
 
-    ws.on('message', (data) => {
+    ws.on('message', async (data) => {
         try {
             const message = JSON.parse(data.toString());
 
@@ -190,6 +339,63 @@ function handleAppConnection(ws) {
                         action: message.action,
                         channel: message.channel,
                         value: message.value
+                    }));
+                }
+            }
+
+            // Handle irrigation commands via WebSocket
+            if (message.type === 'IRRIGATION_COMMAND' && message.token === APP_SECRET) {
+                if (esp32IrrigationSocket && esp32IrrigationSocket.readyState === 1) {
+                    esp32IrrigationSocket.send(JSON.stringify(message));
+                    ws.send(JSON.stringify({
+                        type: 'IRRIGATION_RESPONSE',
+                        success: true
+                    }));
+                } else {
+                    ws.send(JSON.stringify({
+                        type: 'IRRIGATION_RESPONSE',
+                        success: false,
+                        error: 'Irrigation ESP32 not connected'
+                    }));
+                }
+            }
+
+            // Handle robot commands via WebSocket
+            if (message.type === 'ROBOT_COMMAND' && message.token === APP_SECRET) {
+                try {
+                    let result;
+                    const { robotId, command, roomId } = message;
+
+                    switch (command) {
+                        case 'start':
+                            result = await roombaController.start(robotId);
+                            break;
+                        case 'pause':
+                            result = await roombaController.pause(robotId);
+                            break;
+                        case 'stop':
+                            result = await roombaController.stop(robotId);
+                            break;
+                        case 'dock':
+                            result = await roombaController.dock(robotId);
+                            break;
+                        case 'cleanRoom':
+                            result = await roombaController.cleanRoom(robotId, roomId);
+                            break;
+                        default:
+                            throw new Error('Invalid command');
+                    }
+
+                    ws.send(JSON.stringify({
+                        type: 'ROBOT_RESPONSE',
+                        success: true,
+                        data: result
+                    }));
+                } catch (error) {
+                    ws.send(JSON.stringify({
+                        type: 'ROBOT_RESPONSE',
+                        success: false,
+                        error: error.message
                     }));
                 }
             }
@@ -212,13 +418,45 @@ function broadcastToApps(message) {
     });
 }
 
+// ==================== ROBOT CONTROLLER SETUP ====================
+
+// Initialize Roomba Controller
+const roombaController = new RoombaController({
+    roomba_j7: {
+        ip: process.env.ROOMBA_J7_IP,
+        blid: process.env.ROOMBA_J7_BLID,
+        password: process.env.ROOMBA_J7_PASSWORD
+    },
+    braava_jet: {
+        ip: process.env.BRAAVA_JET_IP,
+        blid: process.env.BRAAVA_JET_BLID,
+        password: process.env.BRAAVA_JET_PASSWORD
+    }
+});
+
+// Listen for robot status updates
+roombaController.on('statusUpdate', (statuses) => {
+    // Update local state
+    robotsState = statuses;
+
+    // Broadcast to all connected apps
+    broadcastToApps({
+        type: 'ROBOT_STATE_UPDATE',
+        data: statuses
+    });
+});
+
+// Start polling robot status every 30 seconds
+roombaController.startPolling(30000);
+
 // ==================== HTTP SERVER SETUP ====================
 
 const server = app.listen(PORT, () => {
     console.log(`🚀 Relay Server running on port ${PORT}`);
     console.log(`📡 WebSocket endpoints:`);
-    console.log(`   - /esp32  (for ESP32 device)`);
-    console.log(`   - /app    (for mobile apps)`);
+    console.log(`   - /esp32             (for ESP32 Shutters)`);
+    console.log(`   - /esp32-irrigation  (for ESP32 Irrigation)`);
+    console.log(`   - /app               (for dashboard/mobile apps)`);
 });
 
 // Upgrade HTTP connections to WebSocket
@@ -231,6 +469,7 @@ server.on('upgrade', (request, socket, head) => {
 // Graceful shutdown
 process.on('SIGTERM', () => {
     console.log('SIGTERM received, closing server...');
+    roombaController.disconnect();
     server.close(() => {
         console.log('Server closed');
         process.exit(0);
