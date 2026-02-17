@@ -20,7 +20,7 @@
         "ws": "^8.16.0",
         "cors": "^2.8.5",
         "dotenv": "^16.4.1",
-        "dorita980": "^3.3.2"
+        "dorita980": "^3.1.11"
     },
     "devDependencies": {
         "nodemon": "^3.0.3"
