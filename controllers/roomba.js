@@ -1,9 +1,13 @@
+// iRobot devices use self-signed TLS certificates - must disable rejection
+// before loading dorita980 to prevent Node.js from crashing on connection
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
+
 const dorita980 = require('dorita980');
 const EventEmitter = require('events');
 
 /**
  * RoombaController - Manages iRobot Roomba and Braava devices
- * Uses dorita980 for local network control
+ * Uses dorita980 for local network control via MQTT
  */
 class RoombaController extends EventEmitter {
     constructor(config) {
@@ -11,8 +15,7 @@ class RoombaController extends EventEmitter {
         this.robots = new Map();
         this.config = config;
         this.pollingInterval = null;
-        this.reconnectAttempts = new Map();
-        
+
         // Initialize robots from config
         this.initializeRobots();
     }
@@ -23,46 +26,78 @@ class RoombaController extends EventEmitter {
     initializeRobots() {
         // Initialize Roomba j7
         if (this.config.roomba_j7?.ip && this.config.roomba_j7?.blid && this.config.roomba_j7?.password) {
-            try {
-                this.robots.set('roomba_j7', {
-                    client: new dorita980.Local(
-                        this.config.roomba_j7.blid,
-                        this.config.roomba_j7.password,
-                        this.config.roomba_j7.ip
-                    ),
-                    type: 'vacuum',
-                    name: 'Roomba j7',
-                    connected: false,
-                    lastState: null
-                });
-                console.log('✅ Roomba j7 initialized');
-            } catch (error) {
-                console.error('❌ Failed to initialize Roomba j7:', error.message);
-            }
+            this._initRobot('roomba_j7', this.config.roomba_j7, 'vacuum', 'Roomba j7');
         } else {
             console.warn('⚠️ Roomba j7 credentials not configured');
         }
 
         // Initialize Braava Jet
         if (this.config.braava_jet?.ip && this.config.braava_jet?.blid && this.config.braava_jet?.password) {
-            try {
-                this.robots.set('braava_jet', {
-                    client: new dorita980.Local(
-                        this.config.braava_jet.blid,
-                        this.config.braava_jet.password,
-                        this.config.braava_jet.ip
-                    ),
-                    type: 'mop',
-                    name: 'Braava Jet',
-                    connected: false,
-                    lastState: null
-                });
-                console.log('✅ Braava Jet initialized');
-            } catch (error) {
-                console.error('❌ Failed to initialize Braava Jet:', error.message);
-            }
+            this._initRobot('braava_jet', this.config.braava_jet, 'mop', 'Braava Jet');
         } else {
             console.warn('⚠️ Braava Jet credentials not configured');
+        }
+    }
+
+    /**
+     * Initialize a single robot with proper error handling
+     */
+    _initRobot(robotId, config, type, name) {
+        try {
+            const client = new dorita980.Local(
+                config.blid,
+                config.password,
+                config.ip
+            );
+
+            // Override dorita980's built-in error handler that throws
+            // We need to remove all existing 'error' listeners first
+            client.removeAllListeners('error');
+
+            client.on('error', (err) => {
+                console.error(`❌ ${name} MQTT error:`, err.message);
+                const robot = this.robots.get(robotId);
+                if (robot) robot.connected = false;
+            });
+
+            client.on('connect', () => {
+                console.log(`🟢 ${name} MQTT connected!`);
+                const robot = this.robots.get(robotId);
+                if (robot) robot.connected = true;
+            });
+
+            client.on('close', () => {
+                console.warn(`⚠️ ${name} connection closed`);
+                const robot = this.robots.get(robotId);
+                if (robot) robot.connected = false;
+            });
+
+            client.on('offline', () => {
+                console.warn(`📴 ${name} went offline`);
+                const robot = this.robots.get(robotId);
+                if (robot) robot.connected = false;
+            });
+
+            // Listen for state updates from the robot
+            client.on('state', (state) => {
+                const robot = this.robots.get(robotId);
+                if (robot) {
+                    robot.lastState = state;
+                    robot.connected = true;
+                }
+            });
+
+            this.robots.set(robotId, {
+                client,
+                type,
+                name,
+                connected: false,
+                lastState: null
+            });
+
+            console.log(`✅ ${name} initialized (connecting to ${config.ip}...)`);
+        } catch (error) {
+            console.error(`❌ Failed to initialize ${name}:`, error.message);
         }
     }
 
@@ -70,15 +105,10 @@ class RoombaController extends EventEmitter {
      * Start a robot
      */
     async start(robotId) {
-        const robot = this.robots.get(robotId);
-        if (!robot) {
-            throw new Error(`Robot ${robotId} not found`);
-        }
-
+        const robot = this._getConnectedRobot(robotId);
         try {
             await robot.client.start();
             console.log(`🤖 ${robot.name} started`);
-            this.emit('command', { robotId, command: 'start', success: true });
             return { status: 'started', robot: robotId };
         } catch (error) {
             console.error(`❌ Failed to start ${robot.name}:`, error.message);
@@ -90,15 +120,10 @@ class RoombaController extends EventEmitter {
      * Pause a robot
      */
     async pause(robotId) {
-        const robot = this.robots.get(robotId);
-        if (!robot) {
-            throw new Error(`Robot ${robotId} not found`);
-        }
-
+        const robot = this._getConnectedRobot(robotId);
         try {
             await robot.client.pause();
             console.log(`⏸️ ${robot.name} paused`);
-            this.emit('command', { robotId, command: 'pause', success: true });
             return { status: 'paused', robot: robotId };
         } catch (error) {
             console.error(`❌ Failed to pause ${robot.name}:`, error.message);
@@ -110,15 +135,10 @@ class RoombaController extends EventEmitter {
      * Stop a robot
      */
     async stop(robotId) {
-        const robot = this.robots.get(robotId);
-        if (!robot) {
-            throw new Error(`Robot ${robotId} not found`);
-        }
-
+        const robot = this._getConnectedRobot(robotId);
         try {
             await robot.client.stop();
             console.log(`⏹️ ${robot.name} stopped`);
-            this.emit('command', { robotId, command: 'stop', success: true });
             return { status: 'stopped', robot: robotId };
         } catch (error) {
             console.error(`❌ Failed to stop ${robot.name}:`, error.message);
@@ -130,15 +150,10 @@ class RoombaController extends EventEmitter {
      * Send robot back to dock
      */
     async dock(robotId) {
-        const robot = this.robots.get(robotId);
-        if (!robot) {
-            throw new Error(`Robot ${robotId} not found`);
-        }
-
+        const robot = this._getConnectedRobot(robotId);
         try {
             await robot.client.dock();
             console.log(`🏠 ${robot.name} returning to dock`);
-            this.emit('command', { robotId, command: 'dock', success: true });
             return { status: 'docking', robot: robotId };
         } catch (error) {
             console.error(`❌ Failed to dock ${robot.name}:`, error.message);
@@ -147,72 +162,69 @@ class RoombaController extends EventEmitter {
     }
 
     /**
-     * Get robot status
+     * Get a robot and verify it exists
      */
-    async getStatus(robotId) {
+    _getConnectedRobot(robotId) {
+        const robot = this.robots.get(robotId);
+        if (!robot) {
+            throw new Error(`Robot ${robotId} not found`);
+        }
+        return robot;
+    }
+
+    /**
+     * Get robot status - uses cached state from MQTT stream instead of
+     * calling getRobotState() which can hang if connection is not ready
+     */
+    getStatus(robotId) {
         const robot = this.robots.get(robotId);
         if (!robot) {
             throw new Error(`Robot ${robotId} not found`);
         }
 
-        try {
-            // Request state fields from robot
-            const stateFields = ['cleanMissionStatus', 'batPct', 'bin', 'name', 'pose'];
-            const state = await robot.client.getRobotState(stateFields);
-            
-            robot.connected = true;
-            robot.lastState = state;
+        const state = robot.lastState;
 
-            const status = {
-                robot: robotId,
-                name: robot.name,
-                type: robot.type,
-                connected: true,
-                battery: state.batPct || 0,
-                phase: state.cleanMissionStatus?.phase || 'unknown',
-                cycle: state.cleanMissionStatus?.cycle || 'none',
-                binFull: state.bin?.full || false,
-                error: state.cleanMissionStatus?.error || null,
-                position: state.pose || null,
-                lastUpdate: new Date().toISOString()
-            };
-
-            return status;
-        } catch (error) {
-            console.error(`❌ Failed to get status for ${robot.name}:`, error.message);
-            robot.connected = false;
-            
-            // Return disconnected status
+        if (!robot.connected || !state) {
             return {
                 robot: robotId,
                 name: robot.name,
                 type: robot.type,
-                connected: false,
+                connected: robot.connected,
                 battery: 0,
-                phase: 'disconnected',
-                error: error.message,
+                phase: robot.connected ? 'waiting' : 'disconnected',
+                error: robot.connected ? null : 'Not connected to robot',
                 lastUpdate: new Date().toISOString()
             };
         }
+
+        return {
+            robot: robotId,
+            name: robot.name,
+            type: robot.type,
+            connected: true,
+            battery: state.batPct || 0,
+            phase: state.cleanMissionStatus?.phase || 'unknown',
+            cycle: state.cleanMissionStatus?.cycle || 'none',
+            binFull: state.bin?.full || false,
+            error: state.cleanMissionStatus?.error || null,
+            position: state.pose || null,
+            lastUpdate: new Date().toISOString()
+        };
     }
 
     /**
      * Clean specific room (Roomba j7 only)
      */
     async cleanRoom(robotId, roomId) {
-        const robot = this.robots.get(robotId);
-        if (!robot) {
-            throw new Error(`Robot ${robotId} not found`);
-        }
+        const robot = this._getConnectedRobot(robotId);
 
         if (robot.type !== 'vacuum') {
             throw new Error('Room cleaning only available for vacuum robots');
         }
 
         try {
-            // Get current map ID
-            const state = await robot.client.getRobotState(['pmaps']);
-            const mapId = state.pmaps?.[0]?.id || '';
+            // Use cached state for map ID
+            const mapId = robot.lastState?.pmaps?.[0]?.id || '';
 
             await robot.client.cleanRoom({
                 ordered: 1,
@@ -221,7 +233,6 @@ class RoombaController extends EventEmitter {
             });
 
             console.log(`🤖 ${robot.name} cleaning room ${roomId}`);
-            this.emit('command', { robotId, command: 'cleanRoom', roomId, success: true });
             return { status: 'cleaning_room', robot: robotId, room: roomId };
         } catch (error) {
             console.error(`❌ Failed to clean room for ${robot.name}:`, error.message);
@@ -230,14 +241,14 @@ class RoombaController extends EventEmitter {
     }
 
     /**
-     * Get all robots status
+     * Get all robots status (synchronous - uses cached state)
      */
-    async getAllStatus() {
+    getAllStatus() {
         const statuses = {};
-        
+
         for (const [robotId] of this.robots) {
             try {
-                statuses[robotId] = await this.getStatus(robotId);
+                statuses[robotId] = this.getStatus(robotId);
             } catch (error) {
                 statuses[robotId] = {
                     robot: robotId,
@@ -259,10 +270,10 @@ class RoombaController extends EventEmitter {
         }
 
         console.log(`🔄 Starting robot status polling (${intervalMs}ms interval)`);
-        
-        this.pollingInterval = setInterval(async () => {
+
+        this.pollingInterval = setInterval(() => {
             try {
-                const statuses = await this.getAllStatus();
+                const statuses = this.getAllStatus();
                 this.emit('statusUpdate', statuses);
             } catch (error) {
                 console.error('❌ Error during status polling:', error.message);
@@ -270,9 +281,12 @@ class RoombaController extends EventEmitter {
         }, intervalMs);
 
         // Get initial status immediately
-        this.getAllStatus()
-            .then(statuses => this.emit('statusUpdate', statuses))
-            .catch(error => console.error('❌ Error getting initial status:', error.message));
+        try {
+            const statuses = this.getAllStatus();
+            this.emit('statusUpdate', statuses);
+        } catch (error) {
+            console.error('❌ Error getting initial status:', error.message);
+        }
     }
 
     /**
@@ -305,13 +319,15 @@ class RoombaController extends EventEmitter {
     /**
      * Cleanup and disconnect
      */
-    async disconnect() {
+    disconnect() {
         this.stopPolling();
-        
+
         for (const [robotId, robot] of this.robots) {
             try {
-                // dorita980 doesn't have explicit disconnect
                 console.log(`👋 Disconnecting ${robot.name}`);
+                if (robot.client && typeof robot.client.end === 'function') {
+                    robot.client.end();
+                }
                 robot.connected = false;
             } catch (error) {
                 console.error(`❌ Error disconnecting ${robot.name}:`, error.message);

@@ -1,8 +1,15 @@
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const cors = require('cors');
-const RoombaController = require('./controllers/roomba');
 require('dotenv').config();
+
+// Prevent unhandled errors from crashing the server
+process.on('uncaughtException', (err) => {
+    console.error('⚠️ Uncaught exception:', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('⚠️ Unhandled rejection:', reason?.message || reason);
+});
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -120,52 +127,31 @@ app.get('/api/robots/:id', (req, res) => {
     }
 });
 
-// Send command to robot
-app.post('/api/robots/:id/command', async (req, res) => {
-    const { token, command, roomId } = req.body;
+// Send command to robot (forwarded to ESP32 bridge)
+app.post('/api/robots/:id/command', (req, res) => {
+    const { token, command } = req.body;
     const robotId = req.params.id;
 
-    // Simple auth check
     if (token !== APP_SECRET) {
         return res.status(401).json({ error: 'Unauthorized' });
     }
 
-    // Validate robot exists
     if (!robotsState[robotId]) {
         return res.status(404).json({ error: 'Robot not found' });
     }
 
-    // Execute command
-    try {
-        let result;
-        switch (command) {
-            case 'start':
-                result = await roombaController.start(robotId);
-                break;
-            case 'pause':
-                result = await roombaController.pause(robotId);
-                break;
-            case 'stop':
-                result = await roombaController.stop(robotId);
-                break;
-            case 'dock':
-                result = await roombaController.dock(robotId);
-                break;
-            case 'cleanRoom':
-                if (!roomId) {
-                    return res.status(400).json({ error: 'roomId required for cleanRoom command' });
-                }
-                result = await roombaController.cleanRoom(robotId, roomId);
-                break;
-            default:
-                return res.status(400).json({ error: 'Invalid command' });
-        }
-
-        res.json({ success: true, result });
-    } catch (error) {
-        console.error('Error executing robot command:', error);
-        res.status(500).json({ error: error.message });
+    if (!esp32IrrigationSocket || esp32IrrigationSocket.readyState !== 1) {
+        return res.status(503).json({ error: 'ESP32 bridge not connected' });
     }
+
+    // Forward command to ESP32 Roomba bridge
+    esp32IrrigationSocket.send(JSON.stringify({
+        type: 'ROBOT_FORWARD_COMMAND',
+        robotId,
+        command
+    }));
+
+    res.json({ success: true, message: 'Command forwarded to ESP32 bridge' });
 });
 
 // ==================== WEBSOCKET SERVER (for ESP32 & App) ====================
@@ -300,6 +286,27 @@ function handleESP32IrrigationConnection(ws) {
                 broadcastToApps(message);
             }
 
+            // Handle robot state updates from ESP32 Roomba bridge
+            if (message.type === 'ROBOT_STATE') {
+                robotsState = {
+                    ...message.data,
+                    lastUpdate: new Date().toISOString()
+                };
+                console.log('🤖 Robot state updated from ESP32');
+
+                // Broadcast to all connected apps
+                broadcastToApps({
+                    type: 'ROBOT_STATE_UPDATE',
+                    data: robotsState
+                });
+            }
+
+            // Handle robot command response from ESP32
+            if (message.type === 'ROBOT_RESPONSE') {
+                console.log('🤖 Robot command response:', message);
+                broadcastToApps(message);
+            }
+
         } catch (error) {
             console.error('Error parsing ESP32 Irrigation message:', error);
         }
@@ -309,6 +316,17 @@ function handleESP32IrrigationConnection(ws) {
         console.log('❌ ESP32 Irrigation disconnected');
         if (esp32IrrigationSocket === ws) {
             esp32IrrigationSocket = null;
+
+            // Mark robots as disconnected when ESP32 bridge goes offline
+            for (const robotId of Object.keys(robotsState)) {
+                if (robotsState[robotId] && typeof robotsState[robotId] === 'object') {
+                    robotsState[robotId].connected = false;
+                }
+            }
+            broadcastToApps({
+                type: 'ROBOT_STATE_UPDATE',
+                data: robotsState
+            });
         }
     });
 
@@ -360,42 +378,25 @@ function handleAppConnection(ws) {
                 }
             }
 
-            // Handle robot commands via WebSocket
+            // Handle robot commands via WebSocket — forward to ESP32 bridge
             if (message.type === 'ROBOT_COMMAND' && message.token === APP_SECRET) {
-                try {
-                    let result;
-                    const { robotId, command, roomId } = message;
+                const { robotId, command } = message;
 
-                    switch (command) {
-                        case 'start':
-                            result = await roombaController.start(robotId);
-                            break;
-                        case 'pause':
-                            result = await roombaController.pause(robotId);
-                            break;
-                        case 'stop':
-                            result = await roombaController.stop(robotId);
-                            break;
-                        case 'dock':
-                            result = await roombaController.dock(robotId);
-                            break;
-                        case 'cleanRoom':
-                            result = await roombaController.cleanRoom(robotId, roomId);
-                            break;
-                        default:
-                            throw new Error('Invalid command');
-                    }
-
+                if (esp32IrrigationSocket && esp32IrrigationSocket.readyState === 1) {
+                    esp32IrrigationSocket.send(JSON.stringify({
+                        type: 'ROBOT_FORWARD_COMMAND',
+                        robotId,
+                        command
+                    }));
                     ws.send(JSON.stringify({
                         type: 'ROBOT_RESPONSE',
-                        success: true,
-                        data: result
+                        success: true
                     }));
-                } catch (error) {
+                } else {
                     ws.send(JSON.stringify({
                         type: 'ROBOT_RESPONSE',
                         success: false,
-                        error: error.message
+                        error: 'ESP32 Roomba bridge not connected'
                     }));
                 }
             }
@@ -418,36 +419,7 @@ function broadcastToApps(message) {
     });
 }
 
-// ==================== ROBOT CONTROLLER SETUP ====================
-
-// Initialize Roomba Controller
-const roombaController = new RoombaController({
-    roomba_j7: {
-        ip: process.env.ROOMBA_J7_IP,
-        blid: process.env.ROOMBA_J7_BLID,
-        password: process.env.ROOMBA_J7_PASSWORD
-    },
-    braava_jet: {
-        ip: process.env.BRAAVA_JET_IP,
-        blid: process.env.BRAAVA_JET_BLID,
-        password: process.env.BRAAVA_JET_PASSWORD
-    }
-});
-
-// Listen for robot status updates
-roombaController.on('statusUpdate', (statuses) => {
-    // Update local state
-    robotsState = statuses;
-
-    // Broadcast to all connected apps
-    broadcastToApps({
-        type: 'ROBOT_STATE_UPDATE',
-        data: statuses
-    });
-});
-
-// Start polling robot status every 30 seconds
-roombaController.startPolling(30000);
+// ==================== ROBOT STATE (via ESP32 bridge) ====================
 
 // ==================== HTTP SERVER SETUP ====================
 
@@ -469,7 +441,6 @@ server.on('upgrade', (request, socket, head) => {
 // Graceful shutdown
 process.on('SIGTERM', () => {
     console.log('SIGTERM received, closing server...');
-    roombaController.disconnect();
     server.close(() => {
         console.log('Server closed');
         process.exit(0);
