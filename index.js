@@ -175,6 +175,19 @@ app.get('/api/robots/:id/rooms', (req, res) => {
     }
 });
 
+// API Endpoints for History
+app.get('/api/history/irrigation', async (req, res) => {
+    const limit = parseInt(req.query.limit) || 20;
+    const history = await db.getIrrigationHistory(limit);
+    res.json(history);
+});
+
+app.get('/api/history/robots', async (req, res) => {
+    const limit = parseInt(req.query.limit) || 20;
+    const history = await db.getRobotHistory(limit);
+    res.json(history);
+});
+
 // ==================== WEBSOCKET SERVER (for ESP32 & App) ====================
 
 const wss = new WebSocketServer({ noServer: true });
