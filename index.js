@@ -1,7 +1,13 @@
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const cors = require('cors');
+const { WebSocketServer } = require('ws');
+const cors = require('cors');
 require('dotenv').config();
+const db = require('./services/database');
+
+// Initialize Database
+db.initialize(process.env.SUPABASE_URL, process.env.SUPABASE_KEY);
 
 // Prevent unhandled errors from crashing the server
 process.on('uncaughtException', (err) => {
@@ -283,6 +289,19 @@ function handleESP32IrrigationConnection(ws) {
 
             // Handle state updates from ESP32 Irrigation
             if (message.type === 'IRRIGATION_STATE') {
+                // Detect Irrigation State Changes for Logging
+                if (irrigationState.active !== message.data.active) {
+                    if (message.data.active) {
+                        db.logIrrigation('START', message.data.duration);
+                    } else {
+                        // It stopped. Log duration and estimated water.
+                        // Assuming flow rate ~20L/min (standard garden hose) if not provided
+                        // The message.data might have final telemetry
+                        const waterUsed = message.data.waterUsed || 0;
+                        db.logIrrigation('STOP', message.data.elapsed, waterUsed);
+                    }
+                }
+
                 irrigationState = {
                     ...message.data,
                     lastUpdate: new Date().toISOString()
@@ -304,6 +323,29 @@ function handleESP32IrrigationConnection(ws) {
 
             // Handle robot state updates from ESP32 Roomba bridge
             if (message.type === 'ROBOT_STATE') {
+                // Detect Robot Phase Changes
+                const newRobots = message.data;
+                Object.keys(newRobots).forEach(robotId => {
+                    const oldPhase = robotsState[robotId]?.phase;
+                    const newPhase = newRobots[robotId]?.phase;
+
+                    if (oldPhase !== newPhase && newPhase) {
+                        const details = {
+                            battery: newRobots[robotId].battery,
+                            binFull: newRobots[robotId].binFull,
+                            tankStatus: newRobots[robotId].tankStatus
+                        };
+
+                        // Map status to simpler actions if needed
+                        let action = 'STATUS_CHANGE';
+                        if (newPhase === 'run' && oldPhase !== 'run') action = 'START';
+                        if ((newPhase === 'charge' || newPhase === 'dock') && oldPhase === 'run') action = 'DOCK';
+                        if (newPhase === 'stuck') action = 'ERROR';
+
+                        db.logRobotMission(robotId, action, newPhase, details);
+                    }
+                });
+
                 robotsState = {
                     ...message.data,
                     lastUpdate: new Date().toISOString()

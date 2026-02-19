@@ -16,6 +16,7 @@
     "author": "",
     "license": "MIT",
     "dependencies": {
+        "@supabase/supabase-js": "^2.97.0",
         "cors": "^2.8.5",
         "dorita980": "^3.1.11",
         "dotenv": "^16.4.1",
