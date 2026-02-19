@@ -140,12 +140,12 @@ app.post('/api/robots/:id/command', (req, res) => {
         return res.status(404).json({ error: 'Robot not found' });
     }
 
-    if (!esp32Socket || esp32Socket.readyState !== 1) {
+    if (!esp32IrrigationSocket || esp32IrrigationSocket.readyState !== 1) {
         return res.status(503).json({ error: 'ESP32 bridge not connected' });
     }
 
     // Forward command to ESP32 Roomba bridge
-    esp32Socket.send(JSON.stringify({
+    esp32IrrigationSocket.send(JSON.stringify({
         type: 'ROBOT_FORWARD_COMMAND',
         robotId,
         command
@@ -220,26 +220,6 @@ function handleESP32Connection(ws) {
                 console.log('✓ ESP32 acknowledged command');
             }
 
-            // Handle robot state updates from ESP32 Roomba bridge
-            if (message.type === 'ROBOT_STATE') {
-                robotsState = {
-                    ...message.data,
-                    lastUpdate: new Date().toISOString()
-                };
-                console.log('🤖 Robot state updated from ESP32');
-
-                broadcastToApps({
-                    type: 'ROBOT_STATE_UPDATE',
-                    data: robotsState
-                });
-            }
-
-            // Handle robot command response from ESP32
-            if (message.type === 'ROBOT_RESPONSE') {
-                console.log('🤖 Robot command response:', message);
-                broadcastToApps(message);
-            }
-
         } catch (error) {
             console.error('Error parsing ESP32 message:', error);
         }
@@ -249,17 +229,6 @@ function handleESP32Connection(ws) {
         console.log('❌ ESP32 disconnected');
         if (esp32Socket === ws) {
             esp32Socket = null;
-
-            // Mark robots as disconnected when ESP32 bridge goes offline
-            for (const robotId of Object.keys(robotsState)) {
-                if (robotsState[robotId] && typeof robotsState[robotId] === 'object') {
-                    robotsState[robotId].connected = false;
-                }
-            }
-            broadcastToApps({
-                type: 'ROBOT_STATE_UPDATE',
-                data: robotsState
-            });
         }
     });
 
@@ -317,6 +286,27 @@ function handleESP32IrrigationConnection(ws) {
                 broadcastToApps(message);
             }
 
+            // Handle robot state updates from ESP32 Roomba bridge
+            if (message.type === 'ROBOT_STATE') {
+                robotsState = {
+                    ...message.data,
+                    lastUpdate: new Date().toISOString()
+                };
+                console.log('🤖 Robot state updated from ESP32');
+
+                // Broadcast to all connected apps
+                broadcastToApps({
+                    type: 'ROBOT_STATE_UPDATE',
+                    data: robotsState
+                });
+            }
+
+            // Handle robot command response from ESP32
+            if (message.type === 'ROBOT_RESPONSE') {
+                console.log('🤖 Robot command response:', message);
+                broadcastToApps(message);
+            }
+
         } catch (error) {
             console.error('Error parsing ESP32 Irrigation message:', error);
         }
@@ -326,6 +316,17 @@ function handleESP32IrrigationConnection(ws) {
         console.log('❌ ESP32 Irrigation disconnected');
         if (esp32IrrigationSocket === ws) {
             esp32IrrigationSocket = null;
+
+            // Mark robots as disconnected when ESP32 bridge goes offline
+            for (const robotId of Object.keys(robotsState)) {
+                if (robotsState[robotId] && typeof robotsState[robotId] === 'object') {
+                    robotsState[robotId].connected = false;
+                }
+            }
+            broadcastToApps({
+                type: 'ROBOT_STATE_UPDATE',
+                data: robotsState
+            });
         }
     });
 
@@ -381,8 +382,8 @@ function handleAppConnection(ws) {
             if (message.type === 'ROBOT_COMMAND' && message.token === APP_SECRET) {
                 const { robotId, command } = message;
 
-                if (esp32Socket && esp32Socket.readyState === 1) {
-                    esp32Socket.send(JSON.stringify({
+                if (esp32IrrigationSocket && esp32IrrigationSocket.readyState === 1) {
+                    esp32IrrigationSocket.send(JSON.stringify({
                         type: 'ROBOT_FORWARD_COMMAND',
                         robotId,
                         command
