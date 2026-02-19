@@ -42,6 +42,8 @@ let robotsState = {
     braava_jet: { battery: 0, phase: 'unknown', connected: false, lastUpdate: null }
 };
 
+let robotRoomsData = {};  // Room/zone data from ESP32 discovery
+
 // Simple authentication (can be enhanced later)
 const ESP32_SECRET = process.env.ESP32_SECRET || 'your-esp32-secret-key';
 const ESP32_IRRIGATION_SECRET = process.env.ESP32_IRRIGATION_SECRET || 'my-super-secret-irrigation-key-54321';
@@ -144,14 +146,28 @@ app.post('/api/robots/:id/command', (req, res) => {
         return res.status(503).json({ error: 'ESP32 bridge not connected' });
     }
 
-    // Forward command to ESP32 Roomba bridge
-    esp32IrrigationSocket.send(JSON.stringify({
+    // Forward command to ESP32 Roomba bridge (including args/settings)
+    const forwardMsg = {
         type: 'ROBOT_FORWARD_COMMAND',
         robotId,
         command
-    }));
+    };
+    if (req.body.args) forwardMsg.args = req.body.args;
+    if (req.body.settings) forwardMsg.settings = req.body.settings;
+
+    esp32IrrigationSocket.send(JSON.stringify(forwardMsg));
 
     res.json({ success: true, message: 'Command forwarded to ESP32 bridge' });
+});
+
+// Get robot rooms/zones
+app.get('/api/robots/:id/rooms', (req, res) => {
+    const robotId = req.params.id;
+    if (robotRoomsData[robotId]) {
+        res.json(robotRoomsData[robotId]);
+    } else {
+        res.json({ pmapId: null, regions: [] });
+    }
 });
 
 // ==================== WEBSOCKET SERVER (for ESP32 & App) ====================
@@ -294,10 +310,25 @@ function handleESP32IrrigationConnection(ws) {
                 };
                 console.log('🤖 Robot state updated from ESP32');
 
-                // Broadcast to all connected apps
+                // Broadcast to all connected apps (not back to ESP32s)
                 broadcastToApps({
                     type: 'ROBOT_STATE_UPDATE',
                     data: robotsState
+                });
+            }
+
+            // Handle robot rooms/zones from ESP32
+            if (message.type === 'ROBOT_ROOMS') {
+                // Store room data per robot
+                for (const [robotId, data] of Object.entries(message)) {
+                    if (robotId === 'type') continue; // skip the type field
+                    robotRoomsData[robotId] = data;
+                }
+                console.log('🏠 Robot rooms updated from ESP32');
+
+                broadcastToApps({
+                    type: 'ROBOT_ROOMS_UPDATE',
+                    data: robotRoomsData
                 });
             }
 
@@ -380,14 +411,18 @@ function handleAppConnection(ws) {
 
             // Handle robot commands via WebSocket — forward to ESP32 bridge
             if (message.type === 'ROBOT_COMMAND' && message.token === APP_SECRET) {
-                const { robotId, command } = message;
+                const { robotId, command, args, settings } = message;
 
                 if (esp32IrrigationSocket && esp32IrrigationSocket.readyState === 1) {
-                    esp32IrrigationSocket.send(JSON.stringify({
+                    const forwardMsg = {
                         type: 'ROBOT_FORWARD_COMMAND',
                         robotId,
                         command
-                    }));
+                    };
+                    if (args) forwardMsg.args = args;
+                    if (settings) forwardMsg.settings = settings;
+
+                    esp32IrrigationSocket.send(JSON.stringify(forwardMsg));
                     ws.send(JSON.stringify({
                         type: 'ROBOT_RESPONSE',
                         success: true
@@ -410,10 +445,10 @@ function handleAppConnection(ws) {
     });
 }
 
-// Broadcast state updates to all connected mobile apps
+// Broadcast state updates to all connected mobile apps (excludes ESP32 boards)
 function broadcastToApps(message) {
     wss.clients.forEach((client) => {
-        if (client.readyState === 1 && client !== esp32Socket) {
+        if (client.readyState === 1 && client !== esp32Socket && client !== esp32IrrigationSocket) {
             client.send(JSON.stringify(message));
         }
     });
