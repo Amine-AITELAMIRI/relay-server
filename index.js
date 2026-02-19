@@ -1,8 +1,7 @@
 const express = require('express');
 const { WebSocketServer } = require('ws');
 const cors = require('cors');
-const { WebSocketServer } = require('ws');
-const cors = require('cors');
+// require('dotenv').config(); // Loaded via package.json scripts usually, but harmless here
 require('dotenv').config();
 const db = require('./services/database');
 
