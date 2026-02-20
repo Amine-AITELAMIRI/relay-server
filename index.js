@@ -42,13 +42,6 @@ let irrigationState = {
     lastUpdate: null
 };
 
-let robotsState = {
-    roomba_j7: { battery: 0, phase: 'unknown', connected: false, lastUpdate: null },
-    braava_jet: { battery: 0, phase: 'unknown', connected: false, lastUpdate: null }
-};
-
-let robotRoomsData = {};  // Room/zone data from ESP32 discovery
-
 // Simple authentication (can be enhanced later)
 const ESP32_SECRET = process.env.ESP32_SECRET || 'your-esp32-secret-key';
 const ESP32_IRRIGATION_SECRET = process.env.ESP32_IRRIGATION_SECRET || 'my-super-secret-irrigation-key-54321';
@@ -117,64 +110,6 @@ app.get('/api/schedules', (req, res) => {
     res.json({ message: 'Schedules request sent to ESP32' });
 });
 
-// ==================== ROBOT API ====================
-
-// Get all robots status
-app.get('/api/robots', (req, res) => {
-    res.json(robotsState);
-});
-
-// Get specific robot status
-app.get('/api/robots/:id', (req, res) => {
-    const robotId = req.params.id;
-    if (robotsState[robotId]) {
-        res.json(robotsState[robotId]);
-    } else {
-        res.status(404).json({ error: 'Robot not found' });
-    }
-});
-
-// Send command to robot (forwarded to ESP32 bridge)
-app.post('/api/robots/:id/command', (req, res) => {
-    const { token, command } = req.body;
-    const robotId = req.params.id;
-
-    if (token !== APP_SECRET) {
-        return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    if (!robotsState[robotId]) {
-        return res.status(404).json({ error: 'Robot not found' });
-    }
-
-    if (!esp32IrrigationSocket || esp32IrrigationSocket.readyState !== 1) {
-        return res.status(503).json({ error: 'ESP32 bridge not connected' });
-    }
-
-    // Forward command to ESP32 Roomba bridge (including args/settings)
-    const forwardMsg = {
-        type: 'ROBOT_FORWARD_COMMAND',
-        robotId,
-        command
-    };
-    if (req.body.args) forwardMsg.args = req.body.args;
-    if (req.body.settings) forwardMsg.settings = req.body.settings;
-
-    esp32IrrigationSocket.send(JSON.stringify(forwardMsg));
-
-    res.json({ success: true, message: 'Command forwarded to ESP32 bridge' });
-});
-
-// Get robot rooms/zones
-app.get('/api/robots/:id/rooms', (req, res) => {
-    const robotId = req.params.id;
-    if (robotRoomsData[robotId]) {
-        res.json(robotRoomsData[robotId]);
-    } else {
-        res.json({ pmapId: null, regions: [] });
-    }
-});
-
 // API Endpoints for History
 app.get('/api/history/irrigation', async (req, res) => {
     const limit = parseInt(req.query.limit) || 20;
@@ -182,31 +117,39 @@ app.get('/api/history/irrigation', async (req, res) => {
     res.json(history);
 });
 
-app.get('/api/history/robots', async (req, res) => {
-    const limit = parseInt(req.query.limit) || 20;
-    const history = await db.getRobotHistory(limit);
-    res.json(history);
-});
-
 // ==================== WEBSOCKET SERVER (for ESP32 & App) ====================
 
+// Handle WebSocket upgrades
+// (Server upgrade logic is at the bottom of the file)
 const wss = new WebSocketServer({ noServer: true });
 
-wss.on('connection', (ws, request) => {
-    const clientType = request.url;
+wss.on('connection', (ws, request, clientType) => {
+    console.log(`New connection from ${clientType}`);
 
-    if (clientType === '/esp32') {
-        handleESP32Connection(ws);
-    } else if (clientType === '/esp32-irrigation') {
-        handleESP32IrrigationConnection(ws);
-    } else if (clientType === '/app') {
+    if (clientType === 'app') {
         handleAppConnection(ws);
+    } else if (clientType === 'esp32') {
+        // Disconnect previous shutters controller if exists
+        if (esp32Socket && esp32Socket.readyState === 1) {
+            console.log('⚠️ Closing previous shutters connection');
+            esp32Socket.close();
+        }
+        esp32Socket = ws;
+        handleESP32Connection(ws);
+    } else if (clientType === 'esp32-irrigation') {
+        // Disconnect previous irrigation controller if exists
+        if (esp32IrrigationSocket && esp32IrrigationSocket.readyState === 1) {
+            console.log('⚠️ Closing previous irrigation connection');
+            esp32IrrigationSocket.close();
+        }
+        esp32IrrigationSocket = ws;
+        handleESP32IrrigationConnection(ws);
     } else {
         ws.close();
     }
 });
 
-// Handle ESP32 WebSocket connection
+// Handle ESP32 WebSocket connection (shutters)
 function handleESP32Connection(ws) {
     console.log('🔌 ESP32 connected');
 
@@ -333,65 +276,6 @@ function handleESP32IrrigationConnection(ws) {
                 broadcastToApps(message);
             }
 
-            // Handle robot state updates from ESP32 Roomba bridge
-            if (message.type === 'ROBOT_STATE') {
-                // Detect Robot Phase Changes
-                const newRobots = message.data;
-                Object.keys(newRobots).forEach(robotId => {
-                    const oldPhase = robotsState[robotId]?.phase;
-                    const newPhase = newRobots[robotId]?.phase;
-
-                    if (oldPhase !== newPhase && newPhase) {
-                        const details = {
-                            battery: newRobots[robotId].battery,
-                            binFull: newRobots[robotId].binFull,
-                            tankStatus: newRobots[robotId].tankStatus
-                        };
-
-                        // Map status to simpler actions if needed
-                        let action = 'STATUS_CHANGE';
-                        if (newPhase === 'run' && oldPhase !== 'run') action = 'START';
-                        if ((newPhase === 'charge' || newPhase === 'dock') && oldPhase === 'run') action = 'DOCK';
-                        if (newPhase === 'stuck') action = 'ERROR';
-
-                        db.logRobotMission(robotId, action, newPhase, details);
-                    }
-                });
-
-                robotsState = {
-                    ...message.data,
-                    lastUpdate: new Date().toISOString()
-                };
-                console.log('🤖 Robot state updated from ESP32');
-
-                // Broadcast to all connected apps (not back to ESP32s)
-                broadcastToApps({
-                    type: 'ROBOT_STATE_UPDATE',
-                    data: robotsState
-                });
-            }
-
-            // Handle robot rooms/zones from ESP32
-            if (message.type === 'ROBOT_ROOMS') {
-                // Store room data per robot
-                for (const [robotId, data] of Object.entries(message)) {
-                    if (robotId === 'type') continue; // skip the type field
-                    robotRoomsData[robotId] = data;
-                }
-                console.log('🏠 Robot rooms updated from ESP32');
-
-                broadcastToApps({
-                    type: 'ROBOT_ROOMS_UPDATE',
-                    data: robotRoomsData
-                });
-            }
-
-            // Handle robot command response from ESP32
-            if (message.type === 'ROBOT_RESPONSE') {
-                console.log('🤖 Robot command response:', message);
-                broadcastToApps(message);
-            }
-
         } catch (error) {
             console.error('Error parsing ESP32 Irrigation message:', error);
         }
@@ -401,17 +285,6 @@ function handleESP32IrrigationConnection(ws) {
         console.log('❌ ESP32 Irrigation disconnected');
         if (esp32IrrigationSocket === ws) {
             esp32IrrigationSocket = null;
-
-            // Mark robots as disconnected when ESP32 bridge goes offline
-            for (const robotId of Object.keys(robotsState)) {
-                if (robotsState[robotId] && typeof robotsState[robotId] === 'object') {
-                    robotsState[robotId].connected = false;
-                }
-            }
-            broadcastToApps({
-                type: 'ROBOT_STATE_UPDATE',
-                data: robotsState
-            });
         }
     });
 
@@ -463,32 +336,6 @@ function handleAppConnection(ws) {
                 }
             }
 
-            // Handle robot commands via WebSocket — forward to ESP32 bridge
-            if (message.type === 'ROBOT_COMMAND' && message.token === APP_SECRET) {
-                const { robotId, command, args, settings } = message;
-
-                if (esp32IrrigationSocket && esp32IrrigationSocket.readyState === 1) {
-                    const forwardMsg = {
-                        type: 'ROBOT_FORWARD_COMMAND',
-                        robotId,
-                        command
-                    };
-                    if (args) forwardMsg.args = args;
-                    if (settings) forwardMsg.settings = settings;
-
-                    esp32IrrigationSocket.send(JSON.stringify(forwardMsg));
-                    ws.send(JSON.stringify({
-                        type: 'ROBOT_RESPONSE',
-                        success: true
-                    }));
-                } else {
-                    ws.send(JSON.stringify({
-                        type: 'ROBOT_RESPONSE',
-                        success: false,
-                        error: 'ESP32 Roomba bridge not connected'
-                    }));
-                }
-            }
         } catch (error) {
             console.error('Error parsing app message:', error);
         }
@@ -502,13 +349,13 @@ function handleAppConnection(ws) {
 // Broadcast state updates to all connected mobile apps (excludes ESP32 boards)
 function broadcastToApps(message) {
     wss.clients.forEach((client) => {
-        if (client.readyState === 1 && client !== esp32Socket && client !== esp32IrrigationSocket) {
+        if (client.readyState === 1 &&
+            client !== esp32Socket &&
+            client !== esp32IrrigationSocket) {
             client.send(JSON.stringify(message));
         }
     });
 }
-
-// ==================== ROBOT STATE (via ESP32 bridge) ====================
 
 // ==================== HTTP SERVER SETUP ====================
 
@@ -522,9 +369,23 @@ const server = app.listen(PORT, () => {
 
 // Upgrade HTTP connections to WebSocket
 server.on('upgrade', (request, socket, head) => {
-    wss.handleUpgrade(request, socket, head, (ws) => {
-        wss.emit('connection', ws, request);
-    });
+    const { pathname } = new URL(request.url, `http://${request.headers.host}`);
+
+    if (pathname === '/app') {
+        wss.handleUpgrade(request, socket, head, (ws) => {
+            wss.emit('connection', ws, request, 'app');
+        });
+    } else if (pathname === '/esp32') { // Shutters controller
+        wss.handleUpgrade(request, socket, head, (ws) => {
+            wss.emit('connection', ws, request, 'esp32');
+        });
+    } else if (pathname === '/esp32-irrigation') { // Irrigation controller
+        wss.handleUpgrade(request, socket, head, (ws) => {
+            wss.emit('connection', ws, request, 'esp32-irrigation');
+        });
+    } else {
+        socket.destroy();
+    }
 });
 
 // Graceful shutdown
